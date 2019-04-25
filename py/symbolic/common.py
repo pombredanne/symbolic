@@ -1,39 +1,39 @@
+import os
+import six
+
 from symbolic._lowlevel import lib, ffi
 from symbolic._compat import string_types, int_types
 from symbolic.utils import rustcall, encode_str, decode_str
 from symbolic import exceptions
 
 
-__all__ = ['arch_is_known', 'arch_from_macho', 'arch_to_macho',
-           'arch_get_ip_reg_name', 'parse_addr']
+__all__ = ['arch_is_known', 'arch_get_ip_reg_name', 'normalize_arch', 'parse_addr']
 
 
-ignore_arch_exc = (exceptions.NotFound, exceptions.Parse)
+ignore_arch_exc = (exceptions.UnknownArchError,)
 
 
-def arch_is_known(value):
+# Make sure we init the lib and turn on rust backtraces
+os.environ['RUST_BACKTRACE'] = '1'
+ffi.init_once(lib.symbolic_init, 'init')
+
+
+def arch_is_known(arch):
     """Checks if an architecture is known."""
-    return rustcall(lib.symbolic_arch_is_known, encode_str(value))
+    if not isinstance(arch, six.string_types):
+        return False
+    return rustcall(lib.symbolic_arch_is_known, encode_str(arch))
 
 
-def arch_from_macho(cputype, cpusubtype):
-    """Converts a macho arch tuple into an arch string."""
-    arch = ffi.new('SymbolicMachoArch *')
-    arch[0].cputype = cputype
-    arch[0].cpusubtype = cpusubtype
-    try:
-        return str(decode_str(rustcall(lib.symbolic_arch_from_macho, arch)))
-    except ignore_arch_exc:
-        pass
+def normalize_arch(arch):
+    """Normalizes an architecture name."""
+    if arch is None:
+        return None
+    if not isinstance(arch, six.string_types):
+        raise ValueError('Invalid architecture: expected string')
 
-
-def arch_to_macho(arch):
-    """Converts a macho arch tuple into an arch string."""
-    try:
-        arch = rustcall(lib.symbolic_arch_to_macho, encode_str(arch))
-        return (arch.cputype, arch.cpusubtype)
-    except ignore_arch_exc:
-        pass
+    normalized = rustcall(lib.symbolic_normalize_arch, encode_str(arch))
+    return decode_str(normalized)
 
 
 def arch_get_ip_reg_name(arch):
@@ -45,7 +45,7 @@ def arch_get_ip_reg_name(arch):
         pass
 
 
-def parse_addr(value):
+def parse_addr(x):
     """Parses an address."""
     if x is None:
         return 0

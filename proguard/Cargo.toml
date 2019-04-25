@@ -1,7 +1,21 @@
 [package]
 name = "symbolic-proguard"
-version = "0.1.0"
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-proguard"
+keywords = ["proguard", "retrace", "R8"]
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+description = """
+A library to process ProGuard and R8 mapping files and symbolicate frames from
+optimized applications.
+"""
+edition = "2018"
 
-[dependencies.symbolic-common]
-path = "../common"
+[dependencies]
+proguard = "2.0.0"
+symbolic-common = { version = "6.1.2", path = "../common" }

@@ -1,23 +1,13 @@
 //! Provides symcache support.
-#[macro_use] extern crate symbolic_common;
-extern crate symbolic_debuginfo;
-extern crate symbolic_demangle;
-extern crate uuid;
-extern crate gimli;
-extern crate fallible_iterator;
-extern crate lru_cache;
-extern crate fnv;
-extern crate num;
-#[macro_use] extern crate matches;
-#[macro_use] extern crate if_chain;
 
-mod types;
+#![warn(missing_docs)]
+
 mod cache;
+mod error;
 mod writer;
-mod heuristics;
-mod utils;
 
-pub use types::DataSource;
+pub mod format;
+
 pub use cache::*;
+pub use error::*;
 pub use writer::*;
-pub use heuristics::*;

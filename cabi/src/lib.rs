@@ -1,20 +1,25 @@
 //! Exposes a C-ABI for symbolic
-extern crate symbolic_common;
-extern crate symbolic_demangle;
-extern crate symbolic_debuginfo;
-extern crate symbolic_symcache;
-extern crate uuid;
+#![allow(clippy::cast_ptr_alignment)]
 
-#[macro_use] mod utils;
+#[macro_use]
+mod utils;
 
-mod core;
 mod common;
-mod demangle;
+mod core;
 mod debuginfo;
+mod demangle;
+mod minidump;
+mod proguard;
+mod sourcemap;
 mod symcache;
+mod unreal;
 
-pub use core::*;
-pub use common::*;
-pub use demangle::*;
-pub use debuginfo::*;
-pub use symcache::*;
+pub use crate::common::*;
+pub use crate::core::*;
+pub use crate::debuginfo::*;
+pub use crate::demangle::*;
+pub use crate::minidump::*;
+pub use crate::proguard::*;
+pub use crate::sourcemap::*;
+pub use crate::symcache::*;
+pub use crate::unreal::*;

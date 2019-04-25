@@ -7,7 +7,7 @@
 //! * Swift
 //! * ObjC (only symbol detection)
 //!
-//! As the demangling schemes for different languages are different the
+//! As the demangling schemes for different languages are different, the
 //! feature set is also inconsistent.  In particular Rust for instance has
 //! no overloading so argument types are generally not expected to be
 //! encoded into the function name whereas they are in Swift and C++.
@@ -15,24 +15,26 @@
 //! ## Examples
 //!
 //! ```rust
-//! # extern crate symbolic_demangle;
-//! # extern crate symbolic_common;
-//! # use symbolic_demangle::Symbol;
-//! # use symbolic_common::Language;
+//! use symbolic_common::{Language, Name};
+//! use symbolic_demangle::Demangle;
+//!
 //! # fn main() {
-//! let sym = Symbol::new("__ZN3std2io4Read11read_to_end17hb85a0f6802e14499E");
-//! assert_eq!(sym.language(), Some(Language::Rust));
-//! assert_eq!(sym.to_string(), "std::io::Read::read_to_end");
+//! let name = Name::new("__ZN3std2io4Read11read_to_end17hb85a0f6802e14499E");
+//! assert_eq!(name.detect_language(), Language::Rust);
+//! assert_eq!(name.try_demangle(Default::default()), "std::io::Read::read_to_end");
 //! # }
 //! ```
-extern crate symbolic_common;
-extern crate rustc_demangle;
 
-use symbolic_common::{ErrorKind, Result, Language};
-use std::fmt;
-use std::ptr;
+#![warn(missing_docs)]
+
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
+
+use cpp_demangle::{DemangleOptions as CppOptions, Symbol as CppSymbol};
+use msvc_demangler::DemangleFlags as MsvcFlags;
+
+use symbolic_common::{Language, Name};
 
 extern "C" {
     fn symbolic_demangle_swift(
@@ -41,27 +43,27 @@ extern "C" {
         buf_len: usize,
         simplified: c_int,
     ) -> c_int;
+
     fn symbolic_demangle_is_swift_symbol(sym: *const c_char) -> c_int;
-    fn symbolic_demangle_cpp(
-        sym: *const c_char,
-        buf_out: *mut *mut c_char,
-    ) -> c_int;
-    fn symbolic_demangle_cpp_free(buf: *mut c_char);
 }
 
-/// Defines the output format of the demangler
+/// Defines the output format of the demangler.
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
 pub enum DemangleFormat {
+    /// Strips parameter names and sometimes packages or namespaces.
     Short,
+
+    /// Outputs the full demangled name.
     Full,
 }
 
-/// Options for the demangling
-#[derive(Debug, Clone)]
+/// Options for the demangling.
+#[derive(Debug, Copy, Clone)]
 pub struct DemangleOptions {
-    /// format to use for the output
+    /// Format to use for the output.
     pub format: DemangleFormat,
-    /// Should arguments be returned
+
+    /// Should arguments be returned.
     ///
     /// The default behavior is that arguments are not included in the
     /// demangled output, however they are if you convert the symbol
@@ -78,160 +80,182 @@ impl Default for DemangleOptions {
     }
 }
 
-fn try_demangle_cpp(ident: &str, opts: &DemangleOptions) -> Result<Option<String>> {
-    let ident = unsafe {
-        let mut buf_out = ptr::null_mut();
-        let sym = CString::new(ident.replace("\x00", "")).unwrap();
-        let rv = symbolic_demangle_cpp(sym.as_ptr(), &mut buf_out);
-        if rv == 0 {
-            return Err(ErrorKind::BadSymbol("not a valid C++ identifier".into()).into());
+fn is_maybe_objc(ident: &str) -> bool {
+    (ident.starts_with("-[") || ident.starts_with("+[")) && ident.ends_with(']')
+}
+
+fn is_maybe_cpp(ident: &str) -> bool {
+    ident.starts_with("_Z") || ident.starts_with("__Z")
+}
+
+fn is_maybe_msvc(ident: &str) -> bool {
+    ident.starts_with('?') || ident.starts_with("@?")
+}
+
+fn is_maybe_switf(ident: &str) -> bool {
+    CString::new(ident)
+        .map(|cstr| unsafe { symbolic_demangle_is_swift_symbol(cstr.as_ptr()) != 0 })
+        .unwrap_or(false)
+}
+
+fn try_demangle_msvc(ident: &str, opts: DemangleOptions) -> Option<String> {
+    let flags = match opts.format {
+        DemangleFormat::Full => MsvcFlags::COMPLETE,
+        DemangleFormat::Short => {
+            if opts.with_arguments {
+                MsvcFlags::NO_FUNCTION_RETURNS
+            } else {
+                MsvcFlags::NAME_ONLY
+            }
         }
-        let rv = CStr::from_ptr(buf_out).to_string_lossy().into_owned();
-        symbolic_demangle_cpp_free(buf_out);
-        rv
     };
 
-    if opts.with_arguments {
-        Ok(Some(ident))
-    } else {
-        Ok(ident.split('(').next().map(|x| x.to_string()))
+    msvc_demangler::demangle(ident, flags).ok()
+}
+
+fn try_demangle_cpp(ident: &str, opts: DemangleOptions) -> Option<String> {
+    if is_maybe_msvc(ident) {
+        return try_demangle_msvc(ident, opts);
+    }
+
+    let symbol = match CppSymbol::new(ident) {
+        Ok(symbol) => symbol,
+        Err(_) => return None,
+    };
+
+    let opts = CppOptions {
+        no_params: !opts.with_arguments,
+    };
+
+    match symbol.demangle(&opts) {
+        Ok(demangled) => Some(demangled),
+        Err(_) => None,
     }
 }
 
-fn try_demangle_rust(ident: &str, _opts: &DemangleOptions) -> Result<Option<String>> {
-    if let Ok(dm) = rustc_demangle::try_demangle(ident) {
-        Ok(Some(format!("{:#}", dm)))
-    } else {
-        Err(
-            ErrorKind::BadSymbol("Not a valid Rust symbol".into()).into(),
-        )
+fn try_demangle_rust(ident: &str, _opts: DemangleOptions) -> Option<String> {
+    match rustc_demangle::try_demangle(ident) {
+        Ok(demangled) => Some(format!("{:#}", demangled)),
+        Err(_) => None,
     }
 }
 
-fn try_demangle_swift(ident: &str, opts: &DemangleOptions) -> Result<Option<String>> {
-    let mut buf = vec![0i8; 4096];
+fn try_demangle_swift(ident: &str, opts: DemangleOptions) -> Option<String> {
+    let mut buf = vec![0 as c_char; 4096];
     let sym = match CString::new(ident) {
         Ok(sym) => sym,
-        Err(_) => {
-            return Err(ErrorKind::Internal("embedded null byte").into());
-        }
+        Err(_) => return None,
     };
 
     let simplified = match opts.format {
-        DemangleFormat::Short => if opts.with_arguments {
-            1
-        } else {
-            2
-        },
+        DemangleFormat::Short => {
+            if opts.with_arguments {
+                1
+            } else {
+                2
+            }
+        }
         DemangleFormat::Full => 0,
     };
 
     unsafe {
-        let rv = symbolic_demangle_swift(sym.as_ptr(), buf.as_mut_ptr(), buf.len(), simplified);
-        if rv == 0 {
-            return Ok(None);
+        match symbolic_demangle_swift(sym.as_ptr(), buf.as_mut_ptr(), buf.len(), simplified) {
+            0 => None,
+            _ => Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().to_string()),
         }
-
-        let s = CStr::from_ptr(buf.as_ptr()).to_string_lossy();
-        return Ok(Some(s.to_string()));
     }
 }
 
-/// Represents a mangled symbol.
-///
-/// When created from a string this type wraps a potentially mangled
-/// symbol.  Non mangled symbols are largely ignored by this type and
-/// language checks will not return a language.
-///
-/// Upon formatting the symbol is automatically demangled (without
-/// arguments).
-pub struct Symbol<'a> {
-    mangled: &'a str,
+fn try_demangle_objc(ident: &str, _opts: DemangleOptions) -> Option<String> {
+    Some(ident.to_string())
 }
 
-impl<'a> Symbol<'a> {
-    /// Constructs a new mangled symbol.
-    pub fn new(mangled: &'a str) -> Symbol<'a> {
-        Symbol { mangled: mangled }
-    }
-
-    /// The raw string of the symbol.
-    ///
-    /// If the symbol was not mangled this will also return the input data.
-    pub fn raw(&self) -> &str {
-        self.mangled
-    }
-
-    /// The language of the mangled symbol.
-    ///
-    /// In case the symbol is not mangled or not one of the supported languages
-    /// the return value will be `None`.
-    pub fn language(&self) -> Option<Language> {
-        // objc?
-        if (self.mangled.starts_with("-[") || self.mangled.starts_with("+[")) &&
-            self.mangled.ends_with("]")
-        {
-            return Some(Language::ObjC);
-        }
-
-        // rust
-        if (self.mangled.starts_with("_ZN") || self.mangled.starts_with("__ZN")) &&
-            self.mangled.ends_with("E")
-        {
-            return Some(Language::Rust);
-        }
-
-        // c++
-        if self.mangled.starts_with("_Z") || self.mangled.starts_with("__Z") {
-            return Some(Language::Cpp);
-        }
-
-        // swift?
-        if let Ok(sym) = CString::new(self.mangled) {
-            unsafe {
-                if symbolic_demangle_is_swift_symbol(sym.as_ptr()) != 0 {
-                    return Some(Language::Swift);
-                }
-            }
-        }
-
+fn try_demangle_objcpp(ident: &str, opts: DemangleOptions) -> Option<String> {
+    if is_maybe_objc(ident) {
+        try_demangle_objc(ident, opts)
+    } else if is_maybe_cpp(ident) {
+        try_demangle_cpp(ident, opts)
+    } else {
         None
     }
-
-    /// Demangles a symbol with the given options.
-    pub fn demangle(&self, opts: &DemangleOptions) -> Result<Option<String>> {
-        match self.language() {
-            Some(Language::ObjC) => Ok(Some(self.mangled.to_string())),
-            Some(Language::Rust) => try_demangle_rust(self.mangled, opts),
-            Some(Language::Cpp) => try_demangle_cpp(self.mangled, opts),
-            Some(Language::Swift) => try_demangle_swift(self.mangled, opts),
-            _ => Ok(None),
-        }
-    }
 }
 
-impl<'a> fmt::Display for Symbol<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if let Ok(Some(sym)) = self.demangle(&DemangleOptions {
-            with_arguments: f.alternate(),
-            ..Default::default()
-        }) {
-            write!(f, "{}", sym)
-        } else {
-            write!(f, "{}", self.raw())
-        }
-    }
-}
-
-/// Demangles an identifier.
+/// Allows to demangle potentially mangled names.
 ///
-/// This is a shortcut for using ``Symbol::demangle``.
+/// Non-mangled names are largely ignored and language detection will not
+/// return a language. Upon formatting, the symbol is automatically demangled
+/// (without arguments).
+pub trait Demangle {
+    /// Infers the language of a mangled name.
+    ///
+    /// In case the symbol is not mangled or not one of the supported languages
+    /// the return value will be `None`. If the language of the symbol was
+    /// specified explicitly, this is returned instead.
+    fn detect_language(&self) -> Language;
+
+    /// Demangles the name with the given options.
+    fn demangle(&self, opts: DemangleOptions) -> Option<String>;
+
+    /// Tries to demangle the name and falls back to the original name.
+    fn try_demangle(&self, opts: DemangleOptions) -> Cow<'_, str>;
+}
+
+impl<'a> Demangle for Name<'a> {
+    fn detect_language(&self) -> Language {
+        if self.language() != Language::Unknown {
+            return self.language();
+        }
+
+        if is_maybe_objc(self.as_str()) {
+            return Language::ObjC;
+        }
+
+        if rustc_demangle::try_demangle(self.as_str()).is_ok() {
+            return Language::Rust;
+        }
+
+        if is_maybe_cpp(self.as_str()) || is_maybe_msvc(self.as_str()) {
+            return Language::Cpp;
+        }
+
+        if is_maybe_switf(self.as_str()) {
+            return Language::Swift;
+        }
+
+        Language::Unknown
+    }
+
+    fn demangle(&self, opts: DemangleOptions) -> Option<String> {
+        match self.detect_language() {
+            Language::ObjC => try_demangle_objc(self.as_str(), opts),
+            Language::ObjCpp => try_demangle_objcpp(self.as_str(), opts),
+            Language::Rust => try_demangle_rust(self.as_str(), opts),
+            Language::Cpp => try_demangle_cpp(self.as_str(), opts),
+            Language::Swift => try_demangle_swift(self.as_str(), opts),
+            _ => None,
+        }
+    }
+
+    fn try_demangle(&self, opts: DemangleOptions) -> Cow<'_, str> {
+        match self.demangle(opts) {
+            Some(demangled) => Cow::Owned(demangled),
+            None => Cow::Borrowed(self.as_str()),
+        }
+    }
+}
+
+/// Demangles an identifier and falls back to the original symbol.
+///
+/// This is a shortcut for using ``Name::try_demangle``.
 ///
 /// ```
 /// # use symbolic_demangle::*;
-/// let rv = demangle("_ZN3foo3barE", &Default::default()).unwrap();
-/// assert_eq!(&rv.unwrap(), "foo::bar");
+/// let rv = demangle("_ZN3foo3barE");
+/// assert_eq!(&rv, "foo::bar");
 /// ```
-pub fn demangle(ident: &str, opts: &DemangleOptions) -> Result<Option<String>> {
-    Symbol::new(ident).demangle(opts)
+pub fn demangle(ident: &str) -> Cow<'_, str> {
+    match Name::new(ident).demangle(Default::default()) {
+        Some(demangled) => Cow::Owned(demangled),
+        None => Cow::Borrowed(ident),
+    }
 }

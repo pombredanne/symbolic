@@ -1,164 +1,174 @@
-use std::path::Path;
+//! A wrapper type providing direct memory access to binary data.
+//!
+//! See the [`ByteView`] struct for more documentation.
+//!
+//! [`ByteView`]: struct.ByteView.html
+
 use std::borrow::Cow;
+use std::fs::File;
+use std::io;
 use std::ops::Deref;
+use std::path::Path;
+use std::sync::Arc;
 
-use memmap::{Mmap, Protection};
-use owning_ref::OwningHandle;
+use memmap::Mmap;
 
-use errors::Result;
+use crate::cell::StableDeref;
 
-enum ByteViewInner<'a> {
+/// The owner of data behind a ByteView.
+///
+/// This can either be an mmapped file, an owned buffer or a borrowed binary slice.
+#[derive(Debug)]
+enum ByteViewBacking<'a> {
     Buf(Cow<'a, [u8]>),
     Mmap(Mmap),
 }
 
+impl Deref for ByteViewBacking<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match *self {
+            ByteViewBacking::Buf(ref buf) => buf,
+            ByteViewBacking::Mmap(ref mmap) => mmap,
+        }
+    }
+}
+
 /// A smart pointer for byte data.
 ///
-/// This type can be used to uniformly access bytes that were created
-/// either from mmapping in a path, a vector or a borrowed slice.  A
-/// byteview derefs into a `&[u8]` and is used in symbolic in most
-/// situations where binary files are worked with.
+/// This type can be used to uniformly access bytes that were created either from mmapping in a
+/// path, a vector or a borrowed slice.  A byteview derefs into a `&[u8]` and is used in symbolic in
+/// most situations where binary files are worked with.
 ///
-/// A `ByteView` can be constructed from borrowed slices, vectors or
-/// mmaped from the file system directly.
+/// A `ByteView` can be constructed from borrowed slices, vectors or mmaped from the file system
+/// directly.
 ///
-/// Example use:
+/// # Example
 ///
 /// ```
 /// # use symbolic_common::ByteView;
 /// let bv = ByteView::from_slice(b"1234");
+/// assert_eq!(&*bv, b"1234");
 /// ```
+#[derive(Clone, Debug)]
 pub struct ByteView<'a> {
-    inner: ByteViewInner<'a>,
+    backing: Arc<ByteViewBacking<'a>>,
 }
 
 impl<'a> ByteView<'a> {
-    fn from_cow(cow: Cow<'a, [u8]>) -> ByteView<'a> {
+    fn with_backing(backing: ByteViewBacking<'a>) -> Self {
         ByteView {
-            inner: ByteViewInner::Buf(cow)
+            backing: Arc::new(backing),
         }
     }
 
-    /// Constructs an object file from a byte slice.
-    pub fn from_slice(buffer: &'a [u8]) -> ByteView<'a> {
+    /// Constructs a `ByteView` from a `Cow`.
+    pub fn from_cow(cow: Cow<'a, [u8]>) -> Self {
+        ByteView::with_backing(ByteViewBacking::Buf(cow))
+    }
+
+    /// Constructs a `ByteView` from a byte slice.
+    pub fn from_slice(buffer: &'a [u8]) -> Self {
         ByteView::from_cow(Cow::Borrowed(buffer))
     }
 
-    /// Constructs an object file from a vector.
-    pub fn from_vec(buffer: Vec<u8>) -> ByteView<'static> {
+    /// Constructs a `ByteView` from a vector of bytes.
+    pub fn from_vec(buffer: Vec<u8>) -> Self {
         ByteView::from_cow(Cow::Owned(buffer))
     }
 
-    /// Constructs an object file from a file path.
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<ByteView<'static>> {
-        let mmap = Mmap::open_path(path, Protection::Read)?;
-        Ok(ByteView {
-            inner: ByteViewInner::Mmap(mmap)
-        })
+    /// Constructs a `ByteView` from an open file handle by memory mapping the file.
+    pub fn map_file(file: File) -> Result<Self, io::Error> {
+        let backing = match unsafe { Mmap::map(&file) } {
+            Ok(mmap) => ByteViewBacking::Mmap(mmap),
+            Err(err) => {
+                // this is raised on empty mmaps which we want to ignore.  The
+                // 1006 windows error looks like "The volume for a file has been externally
+                // altered so that the opened file is no longer valid."
+                if err.kind() == io::ErrorKind::InvalidInput
+                    || (cfg!(windows) && err.raw_os_error() == Some(1006))
+                {
+                    ByteViewBacking::Buf(Cow::Borrowed(b""))
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        Ok(ByteView::with_backing(backing))
     }
 
+    /// Constructs a `ByteView` from any `std::io::Reader`.
+    ///
+    /// This currently consumes the entire reader and stores its data in an internal buffer. Prefer
+    /// `ByteView::open` when reading from the file system or `ByteView::from_slice` /
+    /// `ByteView::from_vec` for in-memory operations. This behavior might change in the future.
+    pub fn read<R: io::Read>(mut reader: R) -> Result<Self, io::Error> {
+        let mut buffer = vec![];
+        reader.read_to_end(&mut buffer)?;
+        Ok(ByteView::from_vec(buffer))
+    }
+
+    /// Constructs a `ByteView` from a file path by memory mapping the file.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        let file = File::open(path)?;
+        Self::map_file(file)
+    }
+
+    /// Returns a slice of the underlying data.
     #[inline(always)]
-    fn buffer(&self) -> &[u8] {
-        match self.inner {
-            ByteViewInner::Buf(ref buf) => buf,
-            ByteViewInner::Mmap(ref mmap) => unsafe { mmap.as_slice() },
-        }
+    pub fn as_slice(&self) -> &[u8] {
+        self.backing.deref()
     }
 }
 
-impl<'a> Deref for ByteView<'a> {
+impl AsRef<[u8]> for ByteView<'_> {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Deref for ByteView<'_> {
     type Target = [u8];
 
-    fn deref(&self) -> &[u8] {
-        self.buffer()
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
     }
 }
 
-impl<'a> AsRef<[u8]> for ByteView<'a> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer()
-    }
+unsafe impl StableDeref for ByteView<'_> {}
+
+#[cfg(test)]
+use {failure::Error, std::fs, std::io::Write};
+
+#[test]
+fn test_open_empty_file() -> Result<(), Error> {
+    let mut path = std::env::temp_dir();
+    path.push(".c0b41a59-801b-4d18-aaa1-88432736116d.empty");
+
+    File::create(&path)?;
+    let bv = ByteView::open(&path)?;
+    assert_eq!(&*bv, b"");
+
+    fs::remove_file(&path)?;
+    Ok(())
 }
 
-/// A smart pointer for byte data that owns a derived object.
-///
-/// In some situations symbolic needs to deal with types that are
-/// based on potentially owned or borrowed bytes and wants to provide
-/// another view at them.  This for instance is used when symbolic
-/// works with partially parsed files (like headers) of byte data.
-///
-/// Upon `deref` the inner type is returned.  Additionally the bytes
-/// are exposed through the static `get_bytes` method.
-pub struct ByteViewHandle<'a, T> {
-    inner: OwningHandle<Box<ByteView<'a>>, Box<(&'a [u8], T)>>,
-}
+#[test]
+fn test_open_file() -> Result<(), Error> {
+    let mut path = std::env::temp_dir();
+    path.push(".c0b41a59-801b-4d18-aaa1-88432736116d");
 
-impl<'a, T> ByteViewHandle<'a, T> {
-    /// Creates a new `ByteViewHandle` from a `ByteView`.
-    ///
-    /// The closure is invoked with the borrowed bytes from the original
-    /// byte view and the return value is retained in the handle.
-    pub fn from_byteview<F>(view: ByteView<'a>, f: F) -> Result<ByteViewHandle<'a, T>>
-        where F: FnOnce(&'a [u8]) -> Result<T>
-    {
-        // note on the safety here.  This unsafe pointer juggling causes some
-        // issues.  The underlying OwningHandle is fundamentally unsafe because
-        // it lets you do terrible things with the lifetimes.  A common problem
-        // here is that ByteViewHandle can return views to the underlying data
-        // that outlive it when not written well.
-        //
-        // In particular if you load a ByteView::from_path the lifetime of that
-        // byteview will be 'static.  However the data within that byteview cannot
-        // outlife the byteview.  As such even though the ByteViewHandle is
-        // &'static it must not give out borrows that are that long lasting.
-        //
-        // As such `get_bytes` for instance will only return a borrow scoped
-        // to the lifetime of the `ByteViewHandle`.
-        Ok(ByteViewHandle {
-            inner: OwningHandle::try_new(Box::new(view), |bv| -> Result<_> {
-                let bytes: &[u8] = unsafe { &*bv };
-                Ok(Box::new((bytes, f(bytes)?)))
-            })?
-        })
-    }
+    let mut file = File::create(&path)?;
+    file.write_all(b"1234")?;
+    drop(file);
 
-    /// Constructs an object file from a byte slice.
-    pub fn from_slice<F>(buffer: &'a [u8], f: F) -> Result<ByteViewHandle<'a, T>>
-        where F: FnOnce(&'a [u8]) -> Result<T>
-    {
-        ByteViewHandle::from_byteview(ByteView::from_slice(buffer), f)
-    }
+    let bv = ByteView::open(&path)?;
+    assert_eq!(&*bv, b"1234");
 
-    /// Constructs an object file from a vec
-    pub fn from_vec<F>(vec: Vec<u8>, f: F) -> Result<ByteViewHandle<'static, T>>
-        where F: FnOnce(&'static [u8]) -> Result<T>
-    {
-        ByteViewHandle::from_byteview(ByteView::from_vec(vec), f)
-    }
-
-    /// Constructs an object file from a file path.
-    pub fn from_path<F, P>(path: P, f: F) -> Result<ByteViewHandle<'static, T>>
-        where F: FnOnce(&'static [u8]) -> Result<T>, P: AsRef<Path>
-    {
-        ByteViewHandle::from_byteview(ByteView::from_path(path)?, f)
-    }
-
-    /// Returns the underlying storage (byte slice).
-    pub fn get_bytes<'b>(this: &'b ByteViewHandle<'a, T>) -> &'b [u8] {
-        this.inner.0
-    }
-}
-
-impl<'a, T> Deref for ByteViewHandle<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.inner.1
-    }
-}
-
-impl<'a, T> AsRef<T> for ByteViewHandle<'a, T> {
-    fn as_ref(&self) -> &T {
-        &self.inner.1
-    }
+    fs::remove_file(&path)?;
+    Ok(())
 }

@@ -1,16 +1,39 @@
 [package]
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
 name = "symbolic-debuginfo"
-version = "0.1.0"
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-debuginfo"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+description = """
+A library to inspect and load DWARF debugging information from binaries, such
+as Mach-O or ELF.
+"""
+edition = "2018"
+
+exclude = [
+    "tests/**/*",
+]
 
 [dependencies]
-gimli = { git = "https://github.com/gimli-rs/gimli.git" }
-goblin = "0.0"
-if_chain = "0.1"
-memmap = "0.5"
-scroll = "0.7"
-uuid = "0.5"
+dmsort = "1.0.0"
+failure = "0.1.5"
+fallible-iterator = "0.2.0"
+flate2 = { version = "1.0.6", features = ["rust_backend"], default-features = false }
+gimli = { git = "http://github.com/gimli-rs/gimli", rev = "340106442721983d32e5dee7f9583a2e3b6877bd", features = ["read", "std"], default-features = false }
+goblin = "0.0.22"
+lazycell = "1.2.1"
+pdb = "0.4.0"
+parking_lot = "0.7.1"
+pest = "2.1.0"
+pest_derive = "2.1.0"
+serde = { version = "1.0.89", optional = true }
+smallvec = "0.6.9"
+symbolic-common = { version = "6.1.2", path = "../common" }
 
-[dependencies.symbolic-common]
-path = "../common"
-features = ["with_objects", "with_dwarf"]
+[dev-dependencies]
+insta = "0.7.1"

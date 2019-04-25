@@ -1,15 +1,41 @@
 [package]
 name = "symbolic-minidump"
-version = "0.1.0"
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-minidump"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+description = """
+A library to process and inspect Minidump crash reports
+"""
+build = "build.rs"
+edition = "2018"
+
+include = [
+    "/cpp/**/*",
+    "/src/**/*",
+    "/third_party/breakpad/src/**/*.h",
+    "/third_party/breakpad/src/**/*.c",
+    "/third_party/breakpad/src/**/*.cc",
+    "/third_party/lss/**/*",
+    "/build.rs",
+    "/Cargo.toml",
+]
 
 [dependencies]
-breakpad = "0.1"
-gimli = { git = "https://github.com/gimli-rs/gimli.git" }
-goblin = "0.0"
+failure = "0.1.5"
+lazy_static = "1.3.0"
+regex = "1.1.2"
+serde = { version = "1.0.89", optional = true }
+symbolic-common = { version = "6.1.2", path = "../common" }
+symbolic-debuginfo = { version = "6.1.2", path = "../debuginfo" }
 
-[dependencies.symbolic-common]
-path = "../common"
+[build-dependencies]
+cc = { version = "1.0.31", features = ["parallel"] }
 
-[dependencies.symbolic-debuginfo]
-path = "../debuginfo"
+[dev-dependencies]
+insta = "0.7.1"

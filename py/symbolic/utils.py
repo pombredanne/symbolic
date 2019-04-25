@@ -1,5 +1,7 @@
+import io
 import uuid
 import ntpath
+import weakref
 import posixpath
 from symbolic._lowlevel import ffi, lib
 from symbolic._compat import text_type, NUL
@@ -7,6 +9,9 @@ from symbolic.exceptions import exceptions_by_code, SymbolicError
 
 
 __all__ = ['common_path_join', 'strip_common_path_prefix']
+
+
+attached_refs = weakref.WeakKeyDictionary()
 
 
 def _is_win_path(x):
@@ -36,15 +41,17 @@ def strip_common_path_prefix(base, prefix):
 class RustObject(object):
     __dealloc_func__ = None
     _objptr = None
+    _shared = False
 
     def __init__(self):
         raise TypeError('Cannot instanciate %r objects' %
                         self.__class__.__name__)
 
     @classmethod
-    def _from_objptr(cls, ptr):
+    def _from_objptr(cls, ptr, shared=False):
         rv = object.__new__(cls)
         rv._objptr = ptr
+        rv._shared = shared
         return rv
 
     def _methodcall(self, func, *args):
@@ -55,8 +62,14 @@ class RustObject(object):
             raise RuntimeError('Object is closed')
         return self._objptr
 
+    def _move(self, target):
+        self._shared = True
+        ptr = self._get_objptr()
+        self._objptr = None
+        return ptr
+
     def __del__(self):
-        if self._objptr is None:
+        if self._objptr is None or self._shared:
             return
         f = self.__class__.__dealloc_func__
         if f is not None:
@@ -73,12 +86,22 @@ def rustcall(func, *args):
         return rv
     msg = lib.symbolic_err_get_last_message()
     cls = exceptions_by_code.get(err, SymbolicError)
-    raise cls(decode_str(msg))
+    exc = cls(decode_str(msg))
+    backtrace = decode_str(lib.symbolic_err_get_backtrace())
+    if backtrace:
+        exc.rust_info = backtrace
+    raise exc
 
 
-def decode_str(s):
+def decode_str(s, free=False):
     """Decodes a SymbolicStr"""
-    return ffi.unpack(s.data, s.len).decode('utf-8')
+    try:
+        if s.len == 0:
+            return u''
+        return ffi.unpack(s.data, s.len).decode('utf-8', 'replace')
+    finally:
+        if free:
+            lib.symbolic_str_free(ffi.addressof(s))
 
 
 def encode_str(s):
@@ -86,8 +109,11 @@ def encode_str(s):
     rv = ffi.new('SymbolicStr *')
     if isinstance(s, text_type):
         s = s.encode('utf-8')
-    rv[0].data = ffi.from_buffer(s)
-    rv[0].len = len(s)
+    rv.data = ffi.from_buffer(s)
+    rv.len = len(s)
+    # we have to hold a weak reference here to ensure our string does not
+    # get collected before the string is used.
+    attached_refs[rv] = s
     return rv
 
 
@@ -102,4 +128,57 @@ def encode_path(s):
 
 def decode_uuid(value):
     """Decodes the given uuid value."""
-    return uuid.UUID(bytes=ffi.string(value.data))
+    return uuid.UUID(bytes=bytes(bytearray(ffi.unpack(value.data, 16))))
+
+
+def encode_uuid(value):
+    """Encodes the given uuid value for FFI."""
+    encoded = ffi.new("SymbolicUuid *")
+    encoded.data[0:16] = bytearray(make_uuid(value).bytes)
+    return encoded
+
+
+def make_uuid(value):
+    """Converts a value into a python uuid object."""
+    if isinstance(value, uuid.UUID):
+        return value
+    return uuid.UUID(value)
+
+
+class SliceReader(io.RawIOBase):
+    """A buffered reader that keeps the cache in memory"""
+    def __init__(self, buf, cache):
+        self._buffer = buf
+        # Hold the cache so we do not lose the reference and crash on
+        # the buffer disappearing
+        self.cache = cache
+        self.pos = 0
+
+    @property
+    def size(self):
+        return len(self._buffer)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        n = len(buf)
+        if n is None:
+            end = len(self._buffer)
+        else:
+            end = min(self.pos + n, len(self._buffer))
+        rv = self._buffer[self.pos:end]
+        buf[:len(rv)] = rv
+        self.pos = end
+        return len(rv)
+
+
+class PassThroughBufferedReader(io.BufferedReader):
+    __dict__ = ()
+
+    def __getattr__(self, attr):
+        return getattr(self.raw, attr)
+
+
+def make_buffered_slice_reader(buffer, cache):
+    return PassThroughBufferedReader(SliceReader(buffer, cache))

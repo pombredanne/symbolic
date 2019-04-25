@@ -1,31 +1,408 @@
-use std::io;
-use std::io::Write;
-use std::mem;
-use std::str;
 use std::fmt;
-use std::slice;
-use std::cell::RefCell;
 
-use uuid::Uuid;
+use symbolic_common::{Arch, AsSelf, DebugId, Language, Name};
 
-use symbolic_common::{Result, ErrorKind, ByteView, Arch, Language};
-use symbolic_debuginfo::Object;
-use symbolic_demangle;
+use crate::error::{SymCacheError, SymCacheErrorKind};
+use crate::format;
 
-use types::{CacheFileHeader, Seg, FileRecord, FuncRecord, DataSource};
-use utils::{binsearch_by_key, common_join_path};
-use writer;
+/// A platform independent symbolication cache.
+///
+/// Use [`SymCacheWriter`] writer to create SymCaches, including the conversion from object files.
+///
+/// [`SymCacheWriter`]: struct.SymCacheWriter.html
+pub struct SymCache<'a> {
+    header: format::Header,
+    data: &'a [u8],
+}
 
-/// The magic file header to identify symcache files.
-pub const SYMCACHE_MAGIC: [u8; 4] = [b'S', b'Y', b'M', b'C'];
+impl<'a> SymCache<'a> {
+    /// Parses a SymCache from a binary buffer.
+    pub fn parse(mut data: &'a [u8]) -> Result<Self, SymCacheError> {
+        let header = format::Header::parse(data)?;
 
-/// The latest version of the file format.
-pub const SYMCACHE_LATEST_VERSION: u32 = 1;
+        // The first version of SymCaches used to store offsets relative to the end of the header. This
+        // was corrected in version 2 to store file-absolute offsets.
+        if header.preamble.version == 1 {
+            let offset = std::mem::size_of::<format::HeaderV1>();
+            if data.len() > offset {
+                data = &data[offset..];
+            } else {
+                data = &[];
+            }
+        }
 
-/// A matched symbol
-pub struct Symbol<'a> {
-    cache: &'a SymCache<'a>,
+        Ok(SymCache { header, data })
+    }
+
+    /// The version of the SymCache file format.
+    pub fn version(&self) -> u32 {
+        self.header.preamble.version
+    }
+
+    /// The architecture of the symbol file.
+    pub fn arch(&self) -> Arch {
+        Arch::from_u32(self.header.arch)
+    }
+
+    /// The debuig identifier of the cache file.
+    pub fn debug_id(&self) -> DebugId {
+        self.header.debug_id
+    }
+
+    /// Returns true if line information is included.
+    pub fn has_line_info(&self) -> bool {
+        self.header.has_line_records != 0
+    }
+
+    /// Returns true if file information is included.
+    pub fn has_file_info(&self) -> bool {
+        // See the writers: if there is file information, there are also lines.
+        self.has_line_info()
+    }
+
+    /// Returns an iterator over all functions.
+    pub fn functions(&self) -> Functions<'a> {
+        Functions {
+            functions: self.header.functions,
+            symbols: self.header.symbols,
+            files: self.header.files,
+            data: self.data,
+            index: 0,
+        }
+    }
+
+    /// Given an address this looks up the symbol at that point.
+    ///
+    /// Because of inling information this returns a vector of zero or
+    /// more symbols.  If nothing is found then the return value will be
+    /// an empty vector.
+    pub fn lookup(&self, addr: u64) -> Result<Lookup<'a, '_>, SymCacheError> {
+        let funcs = self.function_records()?;
+
+        // Functions in the function segment are ordered by start address
+        // primarily and by depth secondarily.  As a result we want to have
+        // a secondary comparison by the item index.
+        let mut current_id = match funcs.binary_search_by_key(&addr, format::FuncRecord::addr_start)
+        {
+            Ok(index) => index,
+            Err(0) => return Ok(Lookup::empty(self)),
+            Err(next) => next - 1,
+        };
+
+        // Seek forward to the deepest inlined function at the same address.
+        while let Some(current_fn) = funcs.get(current_id + 1) {
+            if current_fn.addr_start() != funcs[current_id].addr_start() {
+                break;
+            }
+            current_id += 1;
+        }
+
+        // Find the function with the line record closest to the address. There are multiple ways
+        // this lookup can go:
+        //  a. The current function referred to by `current_id` contains the line record responsible
+        //     for the address. However, line records only store the beginning and not the end of
+        //     their range, so we need to check for case (d).
+        //  b. The current function is top-level ends before the search address. This can happen due
+        //     to incomplete debug information or padding sections in the code. There is no match
+        //     for this case.
+        //  c. Same as 2, but for inline functions. Even though the inlinee doesn't match, one of
+        //     its ancestors might still cover with its range. They have to be checked until one
+        //     covers the range. Still, case (d) can apply additionally.
+        //  d. Even though a function covers the search address, it might be interleaved with
+        //     another function that started earlier but contains a line record closer to the search
+        //     address. See below for the lookup strategy.
+        let mut closest = None;
+
+        // Since functions with overlapping ranges can exist, we need to check multiple functions
+        // until we hit a point where we believe no more functions can overlap. Theoretically, this
+        // is the very start of the list. FOR PERFORMANCE REASONS, THIS IMPLEMENATION ONLY CHECKS
+        // FOR OVERLAPS IN INLINE FUNCTIONS.
+        let mut last_id = current_id;
+        loop {
+            let current_fn = &funcs[current_id];
+
+            // If the current function covers the address, resolve the closest line record before
+            // the search address. If it is closer than what we've seen before, this is a better
+            // candidate, otherwise we can discard this function.
+            if current_fn.addr_in_range(addr) {
+                let current_addr = self
+                    .run_to_line(current_fn, addr)?
+                    // A lookup of `None` indicates that there was no line record at all, so just
+                    // assume the function's start address as start of the line.
+                    .map_or(current_fn.addr_start(), |(line_addr, _, _)| line_addr);
+
+                if closest.map_or(true, |(_, _, a)| current_addr > a) {
+                    closest = Some((current_id, current_fn, current_addr));
+                }
+            }
+
+            // We are currently looking at an inline function. Since we're scanning linearly, ensure
+            // that we're also including its parent. This might be from a completely different
+            // inlining branch, so honor the existing `last_id` value as it might be lower.
+            if let Some(parent_id) = current_fn.parent(current_id) {
+                last_id = parent_id.min(last_id);
+            }
+
+            // We've checked the last function (inclusive), so bail out.
+            if current_id == 0 || current_id == last_id {
+                break;
+            }
+
+            // Continue with the immediate predecessor. This is not necessarily the inlining parent,
+            // it might be a completely unrelated function from a different branch. Still, it might
+            // cover the search address, so we cannot jump to the parent directly.
+            current_id -= 1;
+        }
+
+        let (closest_id, closest_fn) = match closest {
+            Some((closest_id, closest_fn, _)) => (closest_id, closest_fn),
+            None => return Ok(Lookup::empty(self)),
+        };
+
+        Ok(Lookup {
+            cache: self,
+            funcs,
+            current: Some((addr, closest_id, closest_fn)),
+            inner: None,
+        })
+    }
+
+    /// Resolves the raw list of `FuncRecords` from the funcs segment.
+    fn function_records(&self) -> Result<&'a [format::FuncRecord], SymCacheError> {
+        self.header.functions.read(self.data)
+    }
+
+    /// Locates the source line record for an instruction address within a function.
+    ///
+    /// This function runs through all line records of the given function and
+    /// returns the line closest to the specified instruction. `addr` must be
+    /// within the function range, otherwise the response is implementation
+    /// defined. However, `addr` may point to any address within an instruction.
+    ///
+    /// Returns some tuple containing:
+    ///  - `.0`: First instruction address of the source line
+    ///  - `.1`: File id of the source file containing this line
+    ///  - `.2`: Line number in the file
+    ///
+    /// Returns `None` if the function does not have line records.
+    fn run_to_line(
+        &self,
+        fun: &format::FuncRecord,
+        addr: u64,
+    ) -> Result<Option<(u64, u16, u32)>, SymCacheError> {
+        let records = fun.line_records.read(self.data)?;
+        if records.is_empty() {
+            // A non-empty function without line records can happen in a couple
+            // of cases:
+            //  1. There was no line information present while generating the
+            //     symcache. This could be due to unsupported debug symbols or
+            //     because they were stripped during the build process.
+            //  2. The symbol was not pulled from debug info but a symbol table.
+            //     such function records will generally have an estimated "size"
+            //     but never line records.
+            //  3. The body of this function consists of only inlined function
+            //     calls. The actual line records of the address range will be
+            //     found in the inlined `FuncRecord`s. The `SymCacheWriter` will
+            //     try to emit synthetic line records in this case, but they
+            //     will be missing if there is not enough debug information.
+            return Ok(None);
+        }
+
+        // Because of how we determine the outer address on expanding
+        // inlines the first address might actually already be missing
+        // the record.  Because of that we pick in any case the first
+        // record as fallback.
+        let mut file_id = records[0].file_id;
+        let mut line = u32::from(records[0].line);
+        let mut running_addr = fun.addr_start();
+        let mut line_addr = running_addr;
+
+        for rec in records {
+            // Keep running until we exceed the search address
+            running_addr += u64::from(rec.addr_off);
+            if running_addr > addr {
+                break;
+            }
+
+            // Remember the starting address of the current line. There might be
+            // multiple line records for a single line if `addr_off` overflows.
+            // So only update `line_addr` if we actually hit a new line.
+            if u32::from(rec.line) != line {
+                line_addr = running_addr;
+            }
+
+            line = u32::from(rec.line);
+            file_id = rec.file_id;
+        }
+
+        Ok(Some((line_addr, file_id, line)))
+    }
+
+    /// Extracts source line information for an instruction address within the
+    /// given `FuncRecord`.
+    ///
+    /// For parents of inlined frames, pass `Some(inner)` to `inner_sym`;
+    /// otherwise None.
+    ///
+    /// This function tries to resolve the source file and line in which the
+    /// corresponding instruction was defined and resolves the full path and
+    /// file name.
+    ///
+    /// The location is first searched within the line records of this function.
+    /// If the function has no own instructions (e.g. due to complete inlining),
+    /// this information is taken from `inner_sym`. If that fails, the file and
+    /// line information will be empty (0 or "").
+    fn build_line_info(
+        &self,
+        fun: &'a format::FuncRecord,
+        addr: u64,
+        inner_sym: Option<(u32, u64, &'a str, &'a str)>,
+    ) -> Result<LineInfo<'a>, SymCacheError> {
+        let (line, line_addr, filename, base_dir) =
+            if let Some((line_addr, file_id, line)) = self.run_to_line(fun, addr)? {
+                // A missing file record indicates a bad symcache.
+                let file_record = read_file_record(self.data, self.header.files, file_id)?
+                    .ok_or_else(|| SymCacheErrorKind::BadCacheFile)?;
+
+                // The address was found in the function's line records, so use
+                // it directly. This should is the default case for all valid
+                // debugging information and the majority of all frames.
+                (
+                    line,
+                    line_addr,
+                    file_record.filename.read_str(self.data)?,
+                    file_record.base_dir.read_str(self.data)?,
+                )
+            } else if let Some(inner_sym) = inner_sym {
+                // The source line was not declared in this function. This
+                // happens, if the function body consists of a single inlined
+                // function call. Usually, the `SymCacheWriter` should emit a
+                // synthetic line record in this case; but if debug symbols did
+                // not provide sufficient information, we will still hit this
+                // case. Use the inlined frame's source location as a
+                // replacement to point somewhere useful.
+                inner_sym
+            } else {
+                // We were unable to find any source code. This can happen for
+                // synthetic functions, such as Swift method thunks. In that
+                // case, we can only return empty line information. Also top-
+                // level functions without line records pulled from the symbol
+                // table will hit this branch.
+                (0, 0, "", "")
+            };
+
+        Ok(LineInfo {
+            arch: self.arch(),
+            debug_id: self.debug_id(),
+            sym_addr: fun.addr_start(),
+            line_addr,
+            instr_addr: addr,
+            line,
+            lang: Language::from_u32(fun.lang.into()),
+            symbol: read_symbol(self.data, self.header.symbols, fun.symbol_id())?,
+            filename,
+            base_dir,
+            comp_dir: fun.comp_dir.read_str(self.data)?,
+        })
+    }
+}
+
+impl<'slf, 'd: 'slf> AsSelf<'slf> for SymCache<'d> {
+    type Ref = SymCache<'slf>;
+
+    fn as_self(&'slf self) -> &Self::Ref {
+        self
+    }
+}
+
+impl fmt::Debug for SymCache<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SymCache")
+            .field("debug_id", &self.debug_id())
+            .field("arch", &self.arch())
+            .field("has_line_info", &self.has_line_info())
+            .field("has_file_info", &self.has_file_info())
+            .field("functions", &self.function_records().unwrap_or(&[]).len())
+            .finish()
+    }
+}
+
+/// An iterator over line matches for an address lookup.
+#[derive(Clone)]
+pub struct Lookup<'a, 'c> {
+    cache: &'c SymCache<'a>,
+    funcs: &'a [format::FuncRecord],
+    current: Option<(u64, usize, &'a format::FuncRecord)>,
+    inner: Option<(u32, u64, &'a str, &'a str)>,
+}
+
+impl<'a, 'c> Lookup<'a, 'c> {
+    fn empty(cache: &'c SymCache<'a>) -> Self {
+        Lookup {
+            cache,
+            funcs: &[],
+            current: None,
+            inner: None,
+        }
+    }
+
+    /// Collects all line matches into a collection.
+    pub fn collect<B>(self) -> Result<B, SymCacheError>
+    where
+        B: std::iter::FromIterator<LineInfo<'a>>,
+    {
+        Iterator::collect(self)
+    }
+}
+
+impl<'a, 'c> Iterator for Lookup<'a, 'c> {
+    type Item = Result<LineInfo<'a>, SymCacheError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (addr, id, fun) = self.current?;
+        let line_result = self.cache.build_line_info(fun, addr, None);
+
+        self.current = fun
+            .parent(id)
+            .map(|parent_id| (fun.addr_start(), parent_id, &self.funcs[parent_id]));
+
+        if let Ok(ref line_info) = line_result {
+            self.inner = Some((
+                line_info.line(),
+                line_info.line_address(),
+                line_info.filename(),
+                line_info.compilation_dir(),
+            ));
+        }
+
+        Some(line_result)
+    }
+}
+
+impl fmt::Debug for Lookup<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for line in self.clone() {
+            match line {
+                Ok(line) => {
+                    list.entry(&line);
+                }
+                Err(error) => {
+                    return error.fmt(f);
+                }
+            }
+        }
+        list.finish()
+    }
+}
+
+/// Information on a matched source line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineInfo<'a> {
+    arch: Arch,
+    debug_id: DebugId,
     sym_addr: u64,
+    line_addr: u64,
     instr_addr: u64,
     line: u32,
     lang: Language,
@@ -35,43 +412,59 @@ pub struct Symbol<'a> {
     comp_dir: &'a str,
 }
 
-/// An abstraction around a symbol cache file.
-pub struct SymCache<'a> {
-    byteview: ByteView<'a>,
-}
-
-fn demangle(sym: &str) -> String {
-    symbolic_demangle::Symbol::new(sym).to_string()
-}
-
-impl<'a> Symbol<'a> {
-    /// The architecture of the matched symbol.
+impl<'a> LineInfo<'a> {
+    /// Architecture of the image referenced by this line.
     pub fn arch(&self) -> Arch {
-        self.cache.arch().unwrap_or(Arch::Unknown)
+        self.arch
     }
 
-    /// The uuid of the matched symbol.
-    pub fn uuid(&self) -> Uuid {
-        self.cache.uuid().unwrap_or(Uuid::nil())
+    /// Debug identifier of the image referenced by this line.
+    pub fn debug_id(&self) -> DebugId {
+        self.debug_id
     }
 
-    /// The address where the symbol starts.
-    pub fn sym_addr(&self) -> u64 {
+    /// The instruction address where the enclosing function starts.
+    pub fn function_address(&self) -> u64 {
         self.sym_addr
     }
 
+    /// The instruction address where the line starts.
+    pub fn line_address(&self) -> u64 {
+        self.line_addr
+    }
+
     /// The actual instruction address.
-    pub fn instr_addr(&self) -> u64 {
+    pub fn instruction_address(&self) -> u64 {
         self.instr_addr
     }
 
-    /// The current line.
+    /// The compilation directory of the function.
+    pub fn compilation_dir(&self) -> &'a str {
+        self.comp_dir
+    }
+
+    /// The base dir of the current line.
+    pub fn base_dir(&self) -> &str {
+        self.base_dir
+    }
+
+    /// The filename of the current line.
+    pub fn filename(&self) -> &'a str {
+        self.filename
+    }
+
+    /// The fully joined path and file name.
+    pub fn path(&self) -> String {
+        symbolic_common::join_path(self.base_dir, self.filename)
+    }
+
+    /// The line number within the file.
     pub fn line(&self) -> u32 {
         self.line
     }
 
-    /// The current language.
-    pub fn lang(&self) -> Language {
+    /// The source code language.
+    pub fn language(&self) -> Language {
         self.lang
     }
 
@@ -80,46 +473,25 @@ impl<'a> Symbol<'a> {
         self.symbol.unwrap_or("?")
     }
 
-    /// The demangled function name.
+    /// The name of the function suitable for demangling.
     ///
-    /// This demangles with default settings.  For further control the symbolic
-    /// demangle crate can be manually used on the symbol.
-    pub fn function_name(&self) -> String {
-        demangle(self.symbol())
-    }
-
-    /// The filename of the current line.
-    pub fn filename(&self) -> &'a str {
-        self.filename
-    }
-
-    /// The base dir of the current line.
-    pub fn base_dir(&self) -> &str {
-        self.base_dir
-    }
-
-    /// The fully joined file name.
-    pub fn full_filename(&self) -> String {
-        common_join_path(self.base_dir, self.filename)
-    }
-
-    /// The compilation dir of the function.
-    pub fn comp_dir(&self) -> &'a str {
-        self.comp_dir
+    /// Use `symbolic::demangle` for demangling this symbol.
+    pub fn function_name(&self) -> Name {
+        Name::with_language(self.symbol(), self.language())
     }
 }
 
-impl<'a> fmt::Display for Symbol<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl fmt::Display for LineInfo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.function_name())?;
         if f.alternate() {
-            let full_filename = self.full_filename();
+            let path = self.path();
             let line = self.line();
-            let lang = self.lang();
-            if full_filename != "" || line != 0 || lang != Language::Unknown {
+            let lang = self.language();
+            if path != "" || line != 0 || lang != Language::Unknown {
                 write!(f, "\n ")?;
-                if full_filename != "" {
-                    write!(f, " at {}", full_filename)?;
+                if path != "" {
+                    write!(f, " at {}", path)?;
                 }
                 if line != 0 {
                     write!(f, " line {}", line)?;
@@ -133,176 +505,209 @@ impl<'a> fmt::Display for Symbol<'a> {
     }
 }
 
-impl<'a> fmt::Debug for Symbol<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Symbol")
-            .field("arch", &self.arch())
-            .field("sym_addr", &self.sym_addr())
-            .field("instr_addr", &self.instr_addr())
-            .field("line", &self.line())
-            .field("symbol", &self.symbol())
-            .field("filename", &self.filename())
-            .field("base_dir", &self.base_dir())
-            .field("comp_dir", &self.comp_dir())
-            .finish()
-    }
-}
-
-/// A view of a single function in a sym cache.
-pub struct Function<'a> {
-    cache: &'a SymCache<'a>,
-    id: u32,
-    fun: &'a FuncRecord,
-}
-
-impl<'a> Function<'a> {
-    /// The ID of the function
-    pub fn id(&self) -> usize {
-        self.id as usize
-    }
-
-    /// The parent ID of the function
-    pub fn parent_id(&self) -> Option<usize> {
-        self.fun.parent(self.id())
-    }
-
-    /// The address where the function starts.
-    pub fn addr(&self) -> u64 {
-        self.fun.addr_start()
-    }
-
-    /// The symbol of the function.
-    pub fn symbol(&self) -> &str {
-        self.cache.get_symbol(self.fun.symbol_id()).unwrap_or(None).unwrap_or("?")
-    }
-
-    /// The demangled function name.
-    ///
-    /// This demangles with default settings.  For further control the symbolic
-    /// demangle crate can be manually used on the symbol.
-    pub fn function_name(&self) -> String {
-        demangle(self.symbol())
-    }
-
-    /// The language of the function
-    pub fn lang(&self) -> Language {
-        Language::from_u32(self.fun.lang as u32).unwrap_or(Language::Unknown)
-    }
-
-    /// The compilation dir of the function
-    pub fn comp_dir(&self) -> &str {
-        self.cache.get_segment_as_string(&self.fun.comp_dir).unwrap_or("")
-    }
-
-    /// An iterator over all lines in the function
-    pub fn lines(&'a self) -> Lines<'a> {
-        Lines {
-            cache: self.cache,
-            fun: &self.fun,
-            addr: self.fun.addr_start(),
-            idx: 0,
-        }
-    }
-}
-
-/// An iterator over all lines.
-pub struct Lines<'a> {
-    cache: &'a SymCache<'a>,
-    fun: &'a FuncRecord,
-    addr: u64,
-    idx: usize,
-}
-
-/// Represents a single line.
-pub struct Line<'a> {
-    cache: &'a SymCache<'a>,
-    addr: u64,
-    line: u16,
-    file_id: u16,
-}
-
-/// An iterator over all functions in a sym cache.
+/// An iterator over all functions in a `SymCache`.
+#[derive(Clone, Debug)]
 pub struct Functions<'a> {
-    cache: &'a SymCache<'a>,
-    idx: usize,
+    functions: format::Seg<format::FuncRecord>,
+    symbols: format::Seg<format::Seg<u8, u16>>,
+    files: format::Seg<format::FileRecord, u16>,
+    data: &'a [u8],
+    index: u32,
 }
 
 impl<'a> Iterator for Functions<'a> {
-    type Item = Result<Function<'a>>;
+    type Item = Result<Function<'a>, SymCacheError>;
 
-    fn next(&mut self) -> Option<Result<Function<'a>>> {
-        let records = itry!(self.cache.function_records());
-        if let Some(fun) = records.get(self.idx) {
-            self.idx += 1;
-            Some(Ok(Function {
-                cache: self.cache,
-                id: (self.idx - 1) as u32,
-                fun: fun,
-            }))
-        } else {
-            None
+    fn next(&mut self) -> Option<Self::Item> {
+        let record = match self.functions.get(self.data, self.index) {
+            Ok(Some(record)) => record,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let function = Some(Ok(Function {
+            record,
+            symbols: self.symbols,
+            files: self.files,
+            data: self.data,
+            index: self.index,
+        }));
+
+        self.index += 1;
+        function
+    }
+}
+
+/// A function in a `SymCache`.
+///
+/// This can be an actual function, an inlined function, or a public symbol.
+#[derive(Clone)]
+pub struct Function<'a> {
+    record: &'a format::FuncRecord,
+    symbols: format::Seg<format::Seg<u8, u16>>,
+    files: format::Seg<format::FileRecord, u16>,
+    data: &'a [u8],
+    index: u32,
+}
+
+impl<'a> Function<'a> {
+    /// The ID of the function.
+    pub fn id(&self) -> usize {
+        self.index as usize
+    }
+
+    /// The ID of the parent function, if this function was inlined.
+    pub fn parent_id(&self) -> Option<usize> {
+        self.record.parent(self.id())
+    }
+
+    /// The address where the function starts.
+    pub fn address(&self) -> u64 {
+        self.record.addr_start()
+    }
+
+    /// The raw name of the function.
+    pub fn symbol(&self) -> &'a str {
+        read_symbol(self.data, self.symbols, self.record.symbol_id())
+            .unwrap_or(None)
+            .unwrap_or("?")
+    }
+
+    /// The language of the function.
+    pub fn language(&self) -> Language {
+        Language::from_u32(self.record.lang.into())
+    }
+
+    /// The name of the function suitable for demangling.
+    ///
+    /// Use `symbolic::demangle` for demangling this symbol.
+    pub fn name(&self) -> Name {
+        Name::with_language(self.symbol(), self.language())
+    }
+
+    /// The compilation dir of the function.
+    pub fn compilation_dir(&self) -> &str {
+        self.record.comp_dir.read_str(self.data).unwrap_or("")
+    }
+
+    /// An iterator over all lines in the function.
+    pub fn lines(&self) -> Lines<'a> {
+        Lines {
+            lines: self.record.line_records,
+            files: self.files,
+            data: self.data,
+            address: 0,
+            index: 0,
         }
     }
 }
 
-impl<'a> Iterator for Lines<'a> {
-    type Item = Result<Line<'a>>;
+/// Helper for printing a human-readable debug representation of line records.
+struct LinesDebug<'a>(Lines<'a>);
 
-    fn next(&mut self) -> Option<Result<Line<'a>>> {
-        let records = itry!(self.cache.get_segment(&self.fun.line_records));
-        if let Some(rec) = records.get(self.idx) {
-            self.idx += 1;
-            self.addr += rec.addr_off as u64;
-            Some(Ok(Line {
-                cache: self.cache,
-                addr: self.addr,
-                line: rec.line,
-                file_id: rec.file_id,
-            }))
-        } else {
-            None
+impl fmt::Debug for LinesDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut list = f.debug_list();
+        for line in self.0.clone() {
+            match line {
+                Ok(line) => {
+                    list.entry(&line);
+                }
+                Err(error) => {
+                    return error.fmt(f);
+                }
+            }
         }
+        list.finish()
     }
 }
 
-struct LineDebug<'a>(RefCell<Option<Lines<'a>>>);
-
-impl<'a> fmt::Debug for LineDebug<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_list()
-            .entries(self.0.borrow_mut().take().unwrap().filter_map(|x| x.ok()))
-            .finish()
-    }
-}
-
-impl<'a> fmt::Debug for Function<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl fmt::Debug for Function<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Function")
             .field("id", &self.id())
             .field("parent_id", &self.parent_id())
             .field("symbol", &self.symbol())
-            .field("addr", &self.addr())
-            .field("comp_dir", &self.comp_dir())
-            .field("lang", &self.lang())
-            .field("lines()", &LineDebug(RefCell::new(Some(self.lines()))))
+            .field("address", &self.address())
+            .field("compilation_dir", &self.compilation_dir())
+            .field("language", &self.language())
+            .field("lines", &LinesDebug(self.lines()))
             .finish()
     }
 }
 
-impl<'a> fmt::Display for Function<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.function_name())?;
-        if f.alternate() && self.lang() != Language::Unknown {
-            write!(f, " [{}]", self.lang())?;
-        }
-        Ok(())
+/// An iterator over lines of a SymCache function.
+#[derive(Clone)]
+pub struct Lines<'a> {
+    lines: format::Seg<format::LineRecord, u16>,
+    files: format::Seg<format::FileRecord, u16>,
+    data: &'a [u8],
+    address: u64,
+    index: u16,
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = Result<Line<'a>, SymCacheError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let record = match self.lines.get(self.data, self.index) {
+            Ok(Some(record)) => record,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+
+        self.address += u64::from(record.addr_off);
+        self.index += 1;
+
+        Some(Ok(Line {
+            record,
+            file: read_file_record(self.data, self.files, record.file_id).unwrap_or(None),
+            address: self.address,
+            data: self.data,
+        }))
     }
 }
 
-impl<'a> fmt::Debug for Line<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+/// A line covered by a [`Function`](struct.Function.html).
+pub struct Line<'a> {
+    record: &'a format::LineRecord,
+    file: Option<&'a format::FileRecord>,
+    data: &'a [u8],
+    address: u64,
+}
+
+impl<'a> Line<'a> {
+    /// The address of the line.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
+    /// The line number of the line.
+    pub fn line(&self) -> u16 {
+        self.record.line
+    }
+
+    /// The base_dir of the line.
+    pub fn base_dir(&self) -> &str {
+        match self.file {
+            Some(ref record) => record.base_dir.read_str(self.data).unwrap_or(""),
+            None => "",
+        }
+    }
+
+    /// The filename of the line.
+    pub fn filename(&self) -> &'a str {
+        match self.file {
+            Some(ref record) => record.filename.read_str(self.data).unwrap_or(""),
+            None => "",
+        }
+    }
+}
+
+impl fmt::Debug for Line<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Line")
-            .field("addr", &self.addr())
+            .field("address", &self.address())
             .field("line", &self.line())
             .field("base_dir", &self.base_dir())
             .field("filename", &self.filename())
@@ -310,309 +715,30 @@ impl<'a> fmt::Debug for Line<'a> {
     }
 }
 
-impl<'a> Line<'a> {
-    /// The filename of the line.
-    pub fn filename(&self) -> &str {
-        if let Some(rec) = self.cache.get_file_record(self.file_id).unwrap_or(None) {
-            self.cache.get_segment_as_string(&rec.filename).unwrap_or("")
-        } else {
-            ""
-        }
-    }
-
-    /// The base_dir of the line.
-    pub fn base_dir(&self) -> &str {
-        if let Some(rec) = self.cache.get_file_record(self.file_id).unwrap_or(None) {
-            self.cache.get_segment_as_string(&rec.base_dir).unwrap_or("")
-        } else {
-            ""
-        }
-    }
-
-    /// The address of the line.
-    pub fn addr(&self) -> u64 {
-        self.addr
-    }
-
-    /// The line number of the line.
-    pub fn line(&self) -> u16 {
-        self.line
+/// Look up a single symbol.
+fn read_symbol(
+    data: &[u8],
+    symbols: format::Seg<format::Seg<u8, u16>>,
+    index: u32,
+) -> Result<Option<&str>, SymCacheError> {
+    if index == !0 {
+        Ok(None)
+    } else if let Some(symbol) = symbols.get(data, index)? {
+        symbol.read_str(data).map(Some)
+    } else {
+        Ok(None)
     }
 }
 
-impl<'a> SymCache<'a> {
-
-    /// Load a symcache from a byteview.
-    pub fn new(byteview: ByteView<'a>) -> Result<SymCache<'a>> {
-        let rv = SymCache {
-            byteview: byteview,
-        };
-        {
-            let header = rv.header()?;
-            if header.magic != SYMCACHE_MAGIC {
-                return Err(ErrorKind::BadCacheFile("Bad file magic").into());
-            }
-            if header.version != 1 {
-                return Err(ErrorKind::BadCacheFile("Unsupported file version").into());
-            }
-        }
-        Ok(rv)
-    }
-
-    /// Constructs a symcache from an object.
-    pub fn from_object(obj: &Object) -> Result<SymCache<'a>> {
-        let vec = writer::to_vec(obj)?;
-        SymCache::new(ByteView::from_vec(vec))
-    }
-
-    /// The total size of the cache file
-    pub fn size(&self) -> usize {
-        self.byteview.len()
-    }
-
-    /// Returns a pointer to the internal bytes of the cache file
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.byteview
-    }
-
-    /// Write the symcache into a new writer.
-    pub fn to_writer<W: Write>(&self, mut writer: W) -> Result<()> {
-        io::copy(&mut &self.byteview[..], &mut writer)?;
-        Ok(())
-    }
-
-    fn get_data(&self, start: usize, len: usize) -> Result<&[u8]> {
-        let buffer = &self.byteview;
-        let end = start.wrapping_add(len);
-        if end < start || end > buffer.len() {
-            Err(
-                io::Error::new(io::ErrorKind::UnexpectedEof, "out of range").into(),
-            )
-        } else {
-            Ok(&buffer[start..end])
-        }
-    }
-
-    fn get_segment<T, L: Copy + Into<u64>>(&self, seg: &Seg<T, L>) -> Result<&[T]> {
-        let offset = seg.offset as usize +
-            mem::size_of::<CacheFileHeader>() as usize;
-        let len: u64 = seg.len.into();
-        let len = len as usize;
-        let size = mem::size_of::<T>() * len;
-        unsafe {
-            let bytes = self.get_data(offset, size)?;
-            Ok(slice::from_raw_parts(
-                mem::transmute(bytes.as_ptr()),
-                len
-            ))
-        }
-    }
-
-    fn get_segment_as_string<L: Copy + Into<u64>>(&self, seg: &Seg<u8, L>) -> Result<&str> {
-        let bytes = self.get_segment(seg)?;
-        Ok(str::from_utf8(bytes)?)
-    }
-
-    #[inline(always)]
-    fn header(&self) -> Result<&CacheFileHeader> {
-        unsafe {
-            Ok(mem::transmute(self.get_data(
-                0, mem::size_of::<CacheFileHeader>())?.as_ptr()))
-        }
-    }
-
-    /// The architecture of the cache file
-    pub fn arch(&self) -> Result<Arch> {
-        Arch::from_u32(self.header()?.arch)
-    }
-
-    /// The uuid of the cache file.
-    pub fn uuid(&self) -> Result<Uuid> {
-        Ok(self.header()?.uuid)
-    }
-
-    /// The source of the sym cache.
-    pub fn data_source(&self) -> Result<DataSource> {
-        DataSource::from_u32(self.header()?.data_source as u32)
-    }
-
-    /// Returns true if line information is included.
-    pub fn has_line_info(&self) -> Result<bool> {
-        Ok(self.header()?.has_line_records != 0)
-    }
-
-    /// Returns true if file information is included.
-    pub fn has_file_info(&self) -> Result<bool> {
-        Ok(match self.data_source()? {
-            DataSource::Dwarf => self.has_line_info()?,
-            _ => false,
-        })
-    }
-
-    /// The version of the cache file.
-    pub fn file_format_version(&self) -> Result<u32> {
-        Ok(self.header()?.version)
-    }
-
-    /// Looks up a single symbol
-    fn get_symbol(&self, idx: u32) -> Result<Option<&str>> {
-        if idx == !0 {
-            return Ok(None);
-        }
-        let header = self.header()?;
-        let syms = self.get_segment(&header.symbols)?;
-        if let Some(ref seg) = syms.get(idx as usize) {
-            Ok(Some(self.get_segment_as_string(seg)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn function_records(&'a self) -> Result<&'a [FuncRecord]> {
-        let header = self.header()?;
-        self.get_segment(&header.function_records)
-    }
-
-    fn get_file_record(&self, idx: u16) -> Result<Option<&FileRecord>> {
-        // no match
-        if idx == !0 {
-            return Ok(None);
-        }
-        let header = self.header()?;
-        let files = self.get_segment(&header.files)?;
-        Ok(files.get(idx as usize))
-    }
-
-    fn run_to_line(&'a self, fun: &'a FuncRecord, addr: u64)
-        -> Result<Option<(&FileRecord, u32)>>
-    {
-        let records = self.get_segment(&fun.line_records)?;
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        // because of how we determine the outer address on expanding
-        // inlines the first address might actually already be missing
-        // the record.  Because of that we pick in any case the first
-        // record as fallback.
-        let mut file_id = records[0].file_id;
-        let mut line = records[0].line as u32;
-        let mut running_addr = fun.addr_start() as u64;
-
-        for rec in records {
-            let new_instr = running_addr + rec.addr_off as u64;
-            if new_instr > addr {
-                break;
-            }
-            running_addr = new_instr;
-            line = rec.line as u32;
-            file_id = rec.file_id;
-        }
-
-        if let Some(ref record) = self.get_file_record(file_id)? {
-            Ok(Some((record, line)))
-        } else {
-            Err(ErrorKind::Internal("unknown file id").into())
-        }
-    }
-
-    fn build_symbol(&'a self, fun: &'a FuncRecord, addr: u64,
-                    inner_sym: Option<&Symbol<'a>>) -> Result<Symbol<'a>> {
-        let (line, filename, base_dir) = match self.run_to_line(fun, addr)? {
-            Some((file_record, line)) => {
-                (
-                    line,
-                    self.get_segment_as_string(&file_record.filename)?,
-                    self.get_segment_as_string(&file_record.base_dir)?,
-                )
-            }
-            None => {
-                if let Some(inner_sym) = inner_sym {
-                    (inner_sym.line, inner_sym.filename, inner_sym.base_dir)
-                } else {
-                    (0, "", "")
-                }
-            }
-        };
-        Ok(Symbol {
-            cache: self,
-            sym_addr: fun.addr_start(),
-            instr_addr: addr,
-            line: line,
-            lang: Language::from_u32(fun.lang as u32).unwrap_or(Language::Unknown),
-            symbol: self.get_symbol(fun.symbol_id())?,
-            filename: filename,
-            base_dir: base_dir,
-            comp_dir: self.get_segment_as_string(&fun.comp_dir)?,
-        })
-    }
-
-    /// Returns an iterator over all functions.
-    pub fn functions(&'a self) -> Functions<'a> {
-        Functions {
-            cache: self,
-            idx: 0,
-        }
-    }
-
-    /// Given an address this looks up the symbol at that point.
-    ///
-    /// Because of inling information this returns a vector of zero or
-    /// more symbols.  If nothing is found then the return value will be
-    /// an empty vector.
-    pub fn lookup(&'a self, addr: u64) -> Result<Vec<Symbol<'a>>> {
-        let funcs = self.function_records()?;
-
-        // functions in the function segment are ordered by start address
-        // primarily and by depth secondarily.  As a result we want to have
-        // a secondary comparison by the item index.
-        let (mut func_id, mut fun) = match binsearch_by_key(
-            funcs, (addr, !0), |idx, rec| (rec.addr_start(), idx))
-        {
-            Some(item) => item,
-            None => { return Ok(vec![]); }
-        };
-
-        // the binsearch might miss the function
-        while !fun.addr_in_range(addr) {
-            if let Some(parent_id) = fun.parent(func_id) {
-                fun = &funcs[parent_id];
-                func_id = parent_id;
-            } else {
-                // we missed entirely :(
-                return Ok(vec![]);
-            }
-        }
-
-        let mut rv = vec![];
-
-        // what we hit directly
-        rv.push(self.build_symbol(&fun, addr, None)?);
-
-        // inlined outer parts
-        while let Some(parent_id) = fun.parent(func_id) {
-            let outer_addr = fun.addr_start();
-            fun = &funcs[parent_id];
-            func_id = parent_id;
-            let symbol = {
-                self.build_symbol(&fun, outer_addr, Some(&rv[rv.len() - 1]))?
-            };
-            rv.push(symbol);
-        }
-
-        Ok(rv)
-    }
-}
-
-impl<'a> fmt::Debug for SymCache<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("SymCache")
-            .field("size", &self.size())
-            .field("arch", &self.arch().unwrap_or(Arch::Unknown))
-            .field("data_source", &self.data_source().unwrap_or(DataSource::Unknown))
-            .field("has_line_info", &self.has_line_info().unwrap_or(false))
-            .field("has_file_info", &self.has_file_info().unwrap_or(false))
-            .field("functions", &self.function_records().map(|x| x.len()).unwrap_or(0))
-            .finish()
+/// Look up a file record.
+fn read_file_record(
+    data: &[u8],
+    files: format::Seg<format::FileRecord, u16>,
+    index: u16,
+) -> Result<Option<&format::FileRecord>, SymCacheError> {
+    if index == !0 {
+        Ok(None)
+    } else {
+        files.get(data, index)
     }
 }

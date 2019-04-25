@@ -1,12 +1,8 @@
 //! Provides minidump support.
-extern crate breakpad;
-extern crate gimli;
-extern crate goblin;
 
-extern crate symbolic_common;
-extern crate symbolic_debuginfo;
+#![warn(missing_docs)]
 
-mod cfi;
-mod registers;
+mod utils;
 
-pub use cfi::*;
+pub mod cfi;
+pub mod processor;

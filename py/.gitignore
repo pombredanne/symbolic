@@ -1,6 +1,11 @@
 symbolic/_lowlevel*
 *.egg-info
 .eggs
+.cache
+.last-run
 dist
 build
 venv
+MANIFEST
+rustsrc.zip
+version.txt

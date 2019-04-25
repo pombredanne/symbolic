@@ -1,18 +1,29 @@
 [package]
 name = "symbolic-common"
-version = "0.1.0"
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-common"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+description = """
+Common types and utilities for symbolic, a library to symbolicate and process
+stack traces from native applications, minidumps, minified JavaScripts or
+ProGuard optimized Android apps.
+"""
+edition = "2018"
 
 [dependencies]
-error-chain = "0.11"
-memmap = "0.5"
-gimli = { git = "https://github.com/gimli-rs/gimli.git", optional = true }
-goblin = { version = "0.0", optional = true }
-scroll = { version = "0.7", optional = true }
-mach_object = { version = "0.1", optional = true }
-owning_ref = "0.3"
+debugid = "0.6.0"
+failure = "0.1.5"
+memmap = "0.7.0"
+stable_deref_trait = "1.1.1"
+serde_ = { package = "serde", version = "1.0.88", optional = true }
+uuid = "0.7.2"
 
 [features]
 default = []
-with_dwarf = ["gimli"]
-with_objects = ["goblin", "scroll", "mach_object"]
+serde = ["serde_", "debugid/serde"]

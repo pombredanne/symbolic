@@ -1,27 +1,31 @@
-//! Common functionality for symbolic.
+//! Common functionality for `symbolic`.
 //!
-//! In particular this defines common error types and similar things
-//! that all symbolic crates want to use.
-#![recursion_limit = "128"]
+//! This crate exposes a set of key types:
+//!
+//!  - [`ByteView`]: Gives access to binary data in-memory or on the file system.
+//!  - [`SelfCell`]: Allows to create self-referential types.
+//!  - [`Name`]: A symbol name that can be demangled with the `demangle` feature.
+//!  - ... and some useful functions to deal with paths in different platforms.
+//!
+//! [`Name`]: struct.Name.html
+//! [`ByteView`]: struct.ByteView.html
+//! [`SelfCell`]: struct.SelfCell.html
 
-#[macro_use]
-extern crate error_chain;
-#[cfg(feature = "with_dwarf")]
-extern crate gimli;
-#[cfg(feature = "with_objects")]
-extern crate goblin;
-#[cfg(feature = "with_objects")]
-extern crate scroll;
-extern crate memmap;
-#[cfg(feature = "with_objects")]
-extern crate mach_object;
-extern crate owning_ref;
+#![warn(missing_docs)]
 
-mod macros;
-mod errors;
-mod types;
 mod byteview;
+mod cell;
+mod fail;
+mod heuristics;
+mod path;
+mod types;
 
-pub use errors::*;
-pub use types::*;
-pub use byteview::*;
+pub use crate::byteview::*;
+pub use crate::cell::*;
+pub use crate::fail::*;
+pub use crate::heuristics::*;
+pub use crate::path::*;
+pub use crate::types::*;
+
+pub use debugid::*;
+pub use uuid::Uuid;

@@ -1,15 +1,72 @@
 [package]
 name = "symbolic"
-version = "0.1.0"
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+readme = "README.md"
+description = """
+A library to symbolicate and process stack traces from native applications,
+minidumps, Unreal Engine 4, minified JavaScripts or ProGuard optimized Android apps.
+"""
+edition = "2018"
+autoexamples = true
+
+include = [
+    "/src/**/*.rs",
+    "/*.toml",
+    "/.gitmodules",
+    "/LICENSE",
+    "/README.md",
+]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [workspace]
 
+[features]
+default = ["debuginfo"]
+common-serde = ["symbolic-common/serde"]
+debuginfo = ["symbolic-debuginfo"]
+debuginfo-serde = ["debuginfo", "common-serde", "symbolic-debuginfo/serde"]
+demangle = ["symbolic-demangle"]
+minidump = ["symbolic-minidump", "debuginfo"]
+minidump-serde = ["minidump", "debuginfo-serde", "symbolic-minidump/serde"]
+proguard = ["symbolic-proguard"]
+sourcemap = ["symbolic-sourcemap"]
+symcache = ["symbolic-symcache", "debuginfo"]
+unreal = ["symbolic-unreal"]
+unreal-serde = ["unreal", "common-serde", "symbolic-unreal/with-serde"]
+
 [dependencies]
-symbolic-common = { path = "common" }
-symbolic-demangle = { path = "demangle" }
-symbolic-minidump = { path = "minidump" }
-symbolic-proguard = { path = "proguard" }
-symbolic-sourcemap = { path = "sourcemap" }
-symbolic-symcache = { path = "symcache" }
-symbolic-debuginfo = { path = "debuginfo" }
+symbolic-common = { version = "6.1.2", path = "common" }
+symbolic-debuginfo = { version = "6.1.2", path = "debuginfo", optional = true }
+symbolic-demangle = { version = "6.1.2", path = "demangle", optional = true }
+symbolic-minidump = { version = "6.1.2", path = "minidump", optional = true }
+symbolic-proguard = { version = "6.1.2", path = "proguard", optional = true }
+symbolic-sourcemap = { version = "6.1.2", path = "sourcemap", optional = true }
+symbolic-symcache = { version = "6.1.2", path = "symcache", optional = true }
+symbolic-unreal = { version = "6.1.2", path = "unreal", optional = true }
+
+[dev-dependencies]
+clap = "2.32.0"
+failure = "0.1.5"
+walkdir = "2.2.7"
+
+[[example]]
+name = "minidump_stackwalk"
+required-features = ["minidump", "symcache"]
+
+[[example]]
+name = "cache_debug"
+required-features = ["symcache", "minidump"]
+
+[[example]]
+name = "unreal_engine_crash"
+required-features = ["unreal"]

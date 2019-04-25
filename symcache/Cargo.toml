@@ -1,21 +1,33 @@
 [package]
 name = "symbolic-symcache"
-version = "0.1.0"
-authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+version = "6.1.2"
+license = "MIT"
+authors = [
+    "Armin Ronacher <armin.ronacher@active-4.com>",
+    "Jan Michael Auer <mail@jauer.org>",
+]
+documentation = "https://docs.rs/symbolic-symcache"
+homepage = "https://github.com/getsentry/symbolic"
+repository = "https://github.com/getsentry/symbolic"
+description = """
+An optimizied cache file for fast and memory efficient lookup of symbols and
+stack frames in debugging information.
+"""
+edition = "2018"
+
+exclude = [
+    "tests/**/*",
+]
 
 [dependencies]
-symbolic-common = { path = "../common", features = ["with_dwarf", "with_objects"] }
-symbolic-debuginfo = { path = "../debuginfo" }
-symbolic-demangle = { path = "../demangle" }
-uuid = { version = "^0.5", features = ["serde"] }
-gimli = { git = "https://github.com/gimli-rs/gimli.git" }
-fallible-iterator = "0.1"
-lru-cache = "0.1"
-owning_ref = "0.3"
-fnv = "1.0"
-num = "0.1"
-matches = "0.1"
-if_chain = "0.1"
+failure = "0.1.5"
+fnv = "1.0.6"
+num = "0.2.0"
+symbolic-common = { version = "6.1.2", path = "../common" }
+symbolic-debuginfo = { version = "6.1.2", path = "../debuginfo" }
 
 [dev-dependencies]
-clap = "2"
+insta = "0.7.1"
+
+[features]
+bench = []
